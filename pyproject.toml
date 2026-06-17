@@ -87,6 +87,15 @@ mocker = [
     "aiconfigurator>=0.9.0,<0.10.0",
 ]
 
+squeeze_evolve = [
+    # Native Squeeze-Evolve port (components/src/dynamo/squeeze_evolve).
+    # numpy for percentile routing thresholds; transformers is already core.
+    # uvloop is the entrypoint's event loop (not a base dep). Tier workers also
+    # need the vllm extra: install `.[squeeze_evolve,vllm]`.
+    "numpy>=1.26.0",
+    "uvloop",
+]
+
 [project.entry-points.pytest11]
 vllm_tests = "dynamo.vllm.tests.conftest"
 trtllm_tests = "dynamo.trtllm.tests.conftest"
