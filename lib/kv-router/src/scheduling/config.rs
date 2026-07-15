@@ -38,6 +38,7 @@ fn sample_active_sequence(sequence: Vec<u64>, stride: usize) -> Vec<u64> {
 }
 
 pub const DYN_ROUTER_MIN_INITIAL_WORKERS: &str = "DYN_ROUTER_MIN_INITIAL_WORKERS";
+pub const DYN_ROUTER_ACTIVE_SEQUENCE_STRIDE: &str = "DYN_ROUTER_ACTIVE_SEQUENCE_STRIDE";
 
 pub fn min_initial_workers_from_env() -> anyhow::Result<usize> {
     match env::var(DYN_ROUTER_MIN_INITIAL_WORKERS) {
@@ -108,9 +109,29 @@ pub fn apply_deprecated_overlap_score_weight_override(
     }
 }
 
+fn active_sequence_stride_env_value(
+    value: Result<String, VarError>,
+) -> anyhow::Result<Option<String>> {
+    match value {
+        Ok(value) => Ok(Some(value)),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(_)) => {
+            anyhow::bail!("{DYN_ROUTER_ACTIVE_SEQUENCE_STRIDE} must be valid unicode")
+        }
+    }
+}
+
 /// Build a [`KvRouterConfig`] from defaults and standard Dynamo environment variables.
-pub fn kv_router_config_from_dynamo_env() -> KvRouterConfig {
-    let config = kv_router_config_from_lookup(|key| env::var(key).ok());
+pub fn kv_router_config_from_dynamo_env() -> anyhow::Result<KvRouterConfig> {
+    let active_sequence_stride =
+        active_sequence_stride_env_value(env::var(DYN_ROUTER_ACTIVE_SEQUENCE_STRIDE))?;
+    let config = kv_router_config_from_lookup(|key| {
+        if key == DYN_ROUTER_ACTIVE_SEQUENCE_STRIDE {
+            active_sequence_stride.clone()
+        } else {
+            env::var(key).ok()
+        }
+    })?;
     tracing::info!(
         overlap_score_credit = config.overlap_score_credit,
         overlap_score_credit_decay = config.overlap_score_credit_decay,
@@ -127,10 +148,12 @@ pub fn kv_router_config_from_dynamo_env() -> KvRouterConfig {
         router_predicted_ttl_secs = ?config.router_predicted_ttl_secs,
         "KvRouterConfig initialized (DYN_* env overrides applied)"
     );
-    config
+    Ok(config)
 }
 
-fn kv_router_config_from_lookup(get_env: impl Fn(&str) -> Option<String>) -> KvRouterConfig {
+fn kv_router_config_from_lookup(
+    get_env: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<KvRouterConfig> {
     fn parse_f64(get_env: &impl Fn(&str) -> Option<String>, key: &str) -> Option<f64> {
         get_env(key).and_then(|value| value.parse().ok())
     }
@@ -180,16 +203,15 @@ fn kv_router_config_from_lookup(get_env: impl Fn(&str) -> Option<String>) -> KvR
     if let Some(value) = parse_bool(&get_env, "DYN_ROUTER_TRACK_ACTIVE_BLOCKS") {
         config.router_track_active_blocks = value;
     }
-    if let Some(raw_value) = get_env("DYN_ROUTER_ACTIVE_SEQUENCE_STRIDE") {
-        let value = raw_value.parse::<usize>().unwrap_or_else(|_| {
-            panic!(
-                "DYN_ROUTER_ACTIVE_SEQUENCE_STRIDE must be an integer greater than or equal to 1"
+    if let Some(raw_value) = get_env(DYN_ROUTER_ACTIVE_SEQUENCE_STRIDE) {
+        let value = raw_value.parse::<usize>().map_err(|error| {
+            anyhow::anyhow!(
+                "{DYN_ROUTER_ACTIVE_SEQUENCE_STRIDE} must be an integer greater than or equal to 1, got {raw_value:?}: {error}"
             )
-        });
-        assert!(
-            value >= 1,
-            "DYN_ROUTER_ACTIVE_SEQUENCE_STRIDE must be greater than or equal to 1"
-        );
+        })?;
+        if value == 0 {
+            anyhow::bail!("{DYN_ROUTER_ACTIVE_SEQUENCE_STRIDE} must be greater than or equal to 1");
+        }
         config.router_active_sequence_stride = value;
     }
     if let Some(value) = parse_bool(&get_env, "DYN_ROUTER_TRACK_OUTPUT_BLOCKS") {
@@ -208,7 +230,7 @@ fn kv_router_config_from_lookup(get_env: impl Fn(&str) -> Option<String>) -> KvR
         config.router_predicted_ttl_secs = Some(value);
     }
 
-    config
+    Ok(config)
 }
 
 fn apply_deprecated_overlap_score_weight_override_option(
@@ -526,7 +548,6 @@ pub struct KvRouterConfig {
 
     /// Retain one active-sequence hash for every N complete prompt blocks.
     /// A value of 1 disables sparsity.
-    #[serde(default = "default_active_sequence_stride")]
     #[validate(range(min = 1))]
     pub router_active_sequence_stride: usize,
 
@@ -886,10 +907,16 @@ impl KvRouterConfig {
             compute_seq_hash_for_block(block_hashes)
         } else {
             let mut rng = rand::rng();
-            (0..num_blocks).map(|_| rng.random::<u64>()).collect()
+            (0..num_blocks / self.router_active_sequence_stride)
+                .map(|_| rng.random::<u64>())
+                .collect()
         };
 
-        Some(self.sample_active_sequence_hashes(sequence))
+        Some(if assume_kv_reuse {
+            self.sample_active_sequence_hashes(sequence)
+        } else {
+            sequence
+        })
     }
 
     /// Check if KV event subscription should be started.
@@ -912,6 +939,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn config_from_values(values: &[(&str, &str)]) -> KvRouterConfig {
+        try_config_from_values(values).unwrap()
+    }
+
+    fn try_config_from_values(values: &[(&str, &str)]) -> anyhow::Result<KvRouterConfig> {
         let values: HashMap<&str, &str> = values.iter().copied().collect();
         kv_router_config_from_lookup(|key| values.get(key).map(|value| (*value).to_string()))
     }
@@ -950,11 +981,31 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "DYN_ROUTER_ACTIVE_SEQUENCE_STRIDE must be greater than or equal to 1"
-    )]
-    fn dynamo_env_config_rejects_zero_active_sequence_stride() {
-        config_from_values(&[("DYN_ROUTER_ACTIVE_SEQUENCE_STRIDE", "0")]);
+    fn dynamo_env_config_returns_errors_for_invalid_active_sequence_stride() {
+        let zero = try_config_from_values(&[(DYN_ROUTER_ACTIVE_SEQUENCE_STRIDE, "0")])
+            .unwrap_err()
+            .to_string();
+        assert!(zero.contains("must be greater than or equal to 1"));
+
+        let malformed = try_config_from_values(&[(DYN_ROUTER_ACTIVE_SEQUENCE_STRIDE, "oops")])
+            .unwrap_err()
+            .to_string();
+        assert!(malformed.contains("must be an integer greater than or equal to 1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dynamo_env_config_rejects_non_unicode_active_sequence_stride() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let error =
+            active_sequence_stride_env_value(Err(VarError::NotUnicode(OsString::from_vec(vec![
+                0xff,
+            ]))))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must be valid unicode"));
     }
 
     #[test]
