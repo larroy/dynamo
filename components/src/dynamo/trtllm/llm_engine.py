@@ -306,6 +306,17 @@ class TrtllmLLMEngine(LLMEngine):
                 kv_cfg = kv_cfg.model_dump(exclude_none=True)
             if not kv_cfg.get("event_buffer_max_size"):
                 kv_cfg["event_buffer_max_size"] = _DEFAULT_KV_EVENT_BUFFER_MAX_SIZE
+            # Only warn on an explicit `false`: TRT-LLM defaults enable_block_reuse
+            # to True, and `exclude_none=True` drops an unset value, so `is False`
+            # fires only for the real serve-but-don't-route trap, never on defaults.
+            if kv_cfg.get("enable_block_reuse") is False:
+                logging.warning(
+                    "kv_cache_config.enable_block_reuse is set to false; TRT-LLM "
+                    "will not publish KV-cache-reuse events. KV-aware routing, if "
+                    "used, falls back to load-balancing; set enable_block_reuse: "
+                    "true to enable it (harmless if events are published only for "
+                    "metrics)."
+                )
             engine_args["kv_cache_config"] = kv_cfg
 
         # Force tokenizer init for the smoke hook, after all overrides so an
