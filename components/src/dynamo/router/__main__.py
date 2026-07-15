@@ -210,6 +210,7 @@ async def worker(runtime: DistributedRuntime):
         f"router_replica_sync={config.router_replica_sync}, "
         f"router_reset_states={config.router_reset_states}, "
         f"router_track_active_blocks={config.router_track_active_blocks}, "
+        f"router_active_sequence_stride={config.router_active_sequence_stride}, "
         f"router_track_output_blocks={config.router_track_output_blocks}, "
         f"router_assume_kv_reuse={config.router_assume_kv_reuse}, "
         f"router_track_prefill_tokens={config.router_track_prefill_tokens}, "
