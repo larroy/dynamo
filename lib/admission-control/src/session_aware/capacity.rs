@@ -10,6 +10,9 @@ use tokio::sync::watch;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerCapacity {
     pub worker: WorkerWithDpRank,
+    /// GPU KV capacity available to requests that may be delivered to the backend.
+    pub device_tokens: usize,
+    /// Combined GPU KV and native-offload capacity used for session retention.
     pub tokens: usize,
 }
 
@@ -67,14 +70,16 @@ where
                 missing_capacity_workers += 1;
                 continue;
             }
-            let tokens = blocks
-                .saturating_mul(u64::from(self.block_size))
+            let device_tokens = blocks.saturating_mul(u64::from(self.block_size));
+            let tokens = device_tokens
                 .saturating_add(config.native_offloading_capacity_tokens().unwrap_or(0));
+            let device_tokens = usize::try_from(device_tokens).unwrap_or(usize::MAX);
             let tokens = usize::try_from(tokens).unwrap_or(usize::MAX);
             let start = config.data_parallel_start_rank();
             let end = start.saturating_add(config.data_parallel_size());
             capacities.extend((start..end).map(|dp_rank| WorkerCapacity {
                 worker: WorkerWithDpRank::new(worker_id, dp_rank),
+                device_tokens,
                 tokens,
             }));
         }
@@ -168,10 +173,12 @@ mod tests {
             &[
                 WorkerCapacity {
                     worker: WorkerWithDpRank::new(11, 2),
+                    device_tokens: 160,
                     tokens: 167,
                 },
                 WorkerCapacity {
                     worker: WorkerWithDpRank::new(11, 3),
+                    device_tokens: 160,
                     tokens: 167,
                 },
             ]

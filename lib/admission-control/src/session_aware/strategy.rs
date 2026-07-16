@@ -209,9 +209,12 @@ impl<P: WorkerCapacityProvider> SessionAwareAdmissionControl<P> {
         let was_new = prior.is_none();
         let was_suspended = prior.as_ref().is_some_and(Program::is_suspended);
         let assigned_worker = prior.as_ref().and_then(|program| program.assigned_worker);
+        let prior_footprint = prior.as_ref().map_or(0, Program::footprint);
         let step_count = prior
             .as_ref()
             .map_or(1, |program| program.step_count.saturating_add(1));
+        let usage = self.worker_usage();
+        let running_usage = self.worker_running_usage();
         let Some(request) = self.requests.get_mut(&id) else {
             return AdmissionDecision::Defer;
         };
@@ -240,7 +243,21 @@ impl<P: WorkerCapacityProvider> SessionAwareAdmissionControl<P> {
         if let Some(worker) = assigned_worker {
             if worker_is_structurally_allowed(worker) {
                 if worker_is_available(worker) {
-                    return AdmissionDecision::Ready(WorkerPlacement::Exact(worker));
+                    let total_used = usage
+                        .get(&worker)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_sub(prior_footprint);
+                    let running_used = running_usage.get(&worker).copied().unwrap_or(0);
+                    if capacities
+                        .iter()
+                        .find(|capacity| capacity.worker == worker)
+                        .is_none_or(|capacity| {
+                            fits_worker_capacity(capacity, total_used, running_used, context_tokens)
+                        })
+                    {
+                        return AdmissionDecision::Ready(WorkerPlacement::Exact(worker));
+                    }
                 }
                 self.defer_request(session_id, id, now, true);
                 return AdmissionDecision::Defer;
@@ -270,16 +287,13 @@ impl<P: WorkerCapacityProvider> SessionAwareAdmissionControl<P> {
             return AdmissionDecision::Ready(WorkerPlacement::Any);
         }
 
-        let usage = self.worker_usage();
         let selected = capacities
             .iter()
             .filter(|capacity| worker_is_available(capacity.worker))
             .filter_map(|capacity| {
                 let used = usage.get(&capacity.worker).copied().unwrap_or(0);
-                capacity
-                    .tokens
-                    .checked_sub(used)
-                    .is_some_and(|remaining| remaining >= context_tokens)
+                let running_used = running_usage.get(&capacity.worker).copied().unwrap_or(0);
+                fits_worker_capacity(capacity, used, running_used, context_tokens)
                     .then_some((capacity.worker, used))
             })
             .min_by_key(|(worker, used)| (*used, *worker))
@@ -430,11 +444,12 @@ impl<P: WorkerCapacityProvider> SessionAwareAdmissionControl<P> {
             .count();
         let capacities = self.capacity.snapshot();
         let mut usage = self.worker_usage();
+        let mut running_usage = self.worker_running_usage();
         let eligibility = self.deferred_eligibility_snapshots();
         let (mut actions, greedy_resumes) = if capacities.is_empty() {
             (Vec::new(), 0)
         } else {
-            self.greedy_resume(&capacities, &mut usage, &eligibility)
+            self.greedy_resume(&capacities, &mut usage, &mut running_usage, &eligibility)
         };
         let (forced_actions, forced_resumes) = self.force_timed_out(&eligibility, now);
         actions.extend(forced_actions);
@@ -512,10 +527,24 @@ impl<P: WorkerCapacityProvider> SessionAwareAdmissionControl<P> {
         usage
     }
 
+    fn worker_running_usage(&self) -> HashMap<WorkerWithDpRank, usize> {
+        let mut usage = HashMap::<WorkerWithDpRank, usize>::new();
+        for program in self.programs.values() {
+            if matches!(&program.state, ProgramState::Running { .. })
+                && let Some(worker) = program.assigned_worker
+            {
+                let used = usage.entry(worker).or_default();
+                *used = used.saturating_add(program.footprint());
+            }
+        }
+        usage
+    }
+
     fn greedy_resume(
         &mut self,
         capacities: &[WorkerCapacity],
         usage: &mut HashMap<WorkerWithDpRank, usize>,
+        running_usage: &mut HashMap<WorkerWithDpRank, usize>,
         eligibility: &HashMap<AdmissionId, WorkerEligibilitySnapshot>,
     ) -> (Vec<AdmissionAction>, usize) {
         let mut paused: Vec<String> = self
@@ -557,6 +586,17 @@ impl<P: WorkerCapacityProvider> SessionAwareAdmissionControl<P> {
         if backend_caps.is_empty() {
             return (Vec::new(), 0);
         }
+        let mut device_remaining: HashMap<_, _> = capacities
+            .iter()
+            .map(|capacity| {
+                (
+                    capacity.worker,
+                    capacity
+                        .device_tokens
+                        .saturating_sub(running_usage.get(&capacity.worker).copied().unwrap_or(0)),
+                )
+            })
+            .collect();
 
         let total_capacity = backend_caps.iter().fold(0usize, |total, (_, remaining)| {
             total.saturating_add(*remaining)
@@ -565,9 +605,17 @@ impl<P: WorkerCapacityProvider> SessionAwareAdmissionControl<P> {
         let mut resumable = Vec::new();
         for session_id in paused {
             let required = self.programs[&session_id].footprint();
+            let has_current_request = self
+                .sessions
+                .get(&session_id)
+                .is_some_and(|requests| requests.current.is_some());
             if !backend_caps.iter().any(|(worker, remaining)| {
                 self.session_allows_worker(&session_id, *worker, eligibility)
                     && required <= *remaining
+                    && (!has_current_request
+                        || device_remaining
+                            .get(worker)
+                            .is_some_and(|available| required <= *available))
             }) {
                 continue;
             }
@@ -580,6 +628,10 @@ impl<P: WorkerCapacityProvider> SessionAwareAdmissionControl<P> {
         let mut actions = Vec::new();
         let mut resumed = 0;
         for session_id in resumable {
+            let has_current_request = self
+                .sessions
+                .get(&session_id)
+                .is_some_and(|requests| requests.current.is_some());
             let Some((position, &(worker, remaining))) =
                 backend_caps
                     .iter()
@@ -587,6 +639,10 @@ impl<P: WorkerCapacityProvider> SessionAwareAdmissionControl<P> {
                     .find(|(_, (worker, remaining))| {
                         self.session_allows_worker(&session_id, *worker, eligibility)
                             && self.programs[&session_id].footprint() <= *remaining
+                            && (!has_current_request
+                                || device_remaining.get(worker).is_some_and(|available| {
+                                    self.programs[&session_id].footprint() <= *available
+                                }))
                     })
             else {
                 continue;
@@ -597,6 +653,14 @@ impl<P: WorkerCapacityProvider> SessionAwareAdmissionControl<P> {
             let program = &self.programs[&session_id];
             let used = usage.entry(worker).or_default();
             *used = used.saturating_add(program.footprint());
+            if has_current_request {
+                let running = running_usage.entry(worker).or_default();
+                *running = running.saturating_add(program.footprint());
+                let available = device_remaining
+                    .get_mut(&worker)
+                    .expect("resume worker must have a device capacity");
+                *available = available.saturating_sub(program.footprint());
+            }
             let updated = remaining - required;
             if updated > 0 {
                 backend_caps[position] = (worker, updated);
@@ -876,6 +940,22 @@ fn scale_tokens(tokens: usize, factor: f64) -> usize {
     ((tokens as f64) * factor).clamp(0.0, usize::MAX as f64) as usize
 }
 
+fn fits_worker_capacity(
+    capacity: &WorkerCapacity,
+    total_used: usize,
+    running_used: usize,
+    request_tokens: usize,
+) -> bool {
+    capacity
+        .tokens
+        .checked_sub(total_used)
+        .is_some_and(|remaining| remaining >= request_tokens)
+        && capacity
+            .device_tokens
+            .checked_sub(running_used)
+            .is_some_and(|remaining| remaining >= request_tokens)
+}
+
 fn sort_backend_caps(capacities: &mut [(WorkerWithDpRank, usize)]) {
     capacities.sort_unstable_by_key(|(worker, remaining)| (Reverse(*remaining), *worker));
 }
@@ -939,6 +1019,18 @@ mod tests {
             .iter()
             .map(|&(id, tokens)| WorkerCapacity {
                 worker: worker(id),
+                device_tokens: tokens,
+                tokens,
+            })
+            .collect()
+    }
+
+    fn tiered_capacities(values: &[(u64, usize, usize)]) -> Vec<WorkerCapacity> {
+        values
+            .iter()
+            .map(|&(id, device_tokens, tokens)| WorkerCapacity {
+                worker: worker(id),
+                device_tokens,
                 tokens,
             })
             .collect()
@@ -1028,6 +1120,28 @@ mod tests {
             strategy.admit(request(2, Some("a"), 120)),
             AdmissionDecision::Ready(WorkerPlacement::Exact(worker(1)))
         );
+    }
+
+    #[test]
+    fn defers_backend_work_before_exhausting_hicache_retention() {
+        let mut strategy = SessionAwareAdmissionControl::new(
+            || tiered_capacities(&[(1, 100, 1_000)]),
+            Default::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            strategy.admit(request(1, Some("running"), 80)),
+            AdmissionDecision::Ready(WorkerPlacement::Exact(worker(1)))
+        );
+        assert_eq!(
+            strategy.admit(request(2, Some("waiting"), 30)),
+            AdmissionDecision::Defer
+        );
+        assert!(strategy.programs["waiting"].is_suspended());
+
+        assert!(reconcile_now(&mut strategy).is_empty());
+        assert!(strategy.programs["waiting"].is_suspended());
     }
 
     #[test]

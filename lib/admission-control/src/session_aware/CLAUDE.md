@@ -28,7 +28,7 @@ The comparison target is `ThunderAgent-org/ThunderAgent` at `7ddc861027`, primar
 | Require a stable `session_id`; bypass sessionless traffic instead of grouping it under a default program. | Identity is the working-set ownership key, and bypass keeps unrelated non-agent traffic out of session-aware admission-control state. |
 | Preserve the assigned worker across normal pressure suspension; upstream clears the backend and BFD may resume elsewhere. Structural worker removal and the starvation timeout remain escape paths. | In the matched replay this removed 219 migrations, improved turns by 12.4%, and raised physical cache reuse by 2.26 percentage points. |
 | Trigger pressure at 0.95, drain to 0.80, and also use 0.80 as the resume ceiling; upstream pauses only after projected overflow and resumes against remaining capacity. | The proactive high/low pair avoids engine-cache saturation, while earlier pausing and a separate resume ceiling both lost throughput or reuse. |
-| Account exact live logical context from `RequestProgress` against device plus native-offload capacity; omit upstream's character estimate, shared-token discount, per-program buffer, ACTING weight, and optional decay. | Exact Dynamo observations remove interacting heuristics; the buffer ablation did not help, and no retained decision required decay or polled residency. |
+| Account exact live logical context from `RequestProgress`; use device capacity to admit Running requests and device plus native-offload capacity for retained sessions. Omit upstream's character estimate, shared-token discount, per-program buffer, ACTING weight, and optional decay. | Host HiCache can retain an idle session, but must not be treated as room to enqueue more backend work. Exact Dynamo observations remove interacting heuristics. |
 | Expire quiescent state after a 30-minute inactivity lease instead of requiring upstream's explicit `/programs/release` call. | Immediate terminal cleanup admitted too much live context and hurt reuse; the lease bounded retained state while matching or improving the no-expiry control. |
 | Encode only `Running`, `IdleResident`, and `Suspended`, with waiters and rollback owned by native queue admission. | This removes invalid status/lifecycle combinations and gives cancellation and same-session concurrency one authoritative owner without changing the retained pause/resume policy. |
 
@@ -57,7 +57,7 @@ AdmissionRequest
        -> sticky worker temporarily overloaded: Defer without migration
        -> new session while any session is suspended: Defer for fairness
        -> no eligible worker has usable capacity metadata: Ready(Any), letting the normal router fail open
-       -> enough projected capacity: Ready(Exact) on least-used eligible worker
+       -> enough device running capacity and total retention capacity: Ready(Exact) on least-used eligible worker
        -> otherwise: Defer
   -> router queue and selector
   -> Dispatched: commit the selected worker
@@ -70,7 +70,7 @@ Worker eligibility is live. A deferred request retains `WorkerEligibility` and t
 
 ## Logical capacity accounting
 
-Capacity is `total_kv_blocks * block_size + native_offloading_capacity_tokens` for each worker/rank. Workers with missing or zero device capacity are excluded from session-aware admission-control capacity gating, with a one-time warning. If no worker reports usable metadata, capacity gating is disabled and requests continue through normal router selection.
+Total retention capacity is `total_kv_blocks * block_size + native_offloading_capacity_tokens` for each worker/rank. A Running request must additionally fit in `total_kv_blocks * block_size` device capacity; this keeps the deferred queue ahead of SGLang even when host HiCache has room. Workers with missing or zero device capacity are excluded from session-aware admission-control capacity gating, with a one-time warning. If no worker reports usable metadata, capacity gating is disabled and requests continue through normal router selection.
 
 Only Running or IdleResident programs with an assigned worker contribute usage:
 
