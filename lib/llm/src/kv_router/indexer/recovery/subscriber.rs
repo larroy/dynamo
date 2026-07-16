@@ -18,6 +18,8 @@ use dynamo_runtime::{
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+use super::{IndexerRecoveryTarget, RecoveryTarget};
+
 /// Start a simplified background task for event consumption using the event plane.
 ///
 /// This is used when local indexer mode is enabled. Unlike `start_kv_router_background`,
@@ -30,13 +32,13 @@ use tokio_util::sync::CancellationToken;
 /// This is appropriate when workers have local indexers enabled.
 async fn start_kv_router_background_event_plane(
     component: Component,
-    indexer: Indexer,
+    target: Arc<dyn RecoveryTarget>,
     transport_kind: EventTransportKind,
     workers_with_configs: RuntimeConfigWatch,
     model: String,
     worker_type: &'static str,
     cancellation_token: CancellationToken,
-) -> Result<()> {
+) -> Result<Arc<WorkerQueryClient>> {
     // Subscribe to KV events BEFORE spawning the discovery/recovery loop.
     // This ensures no events are lost between the initial dump fetch and the
     // subscription becoming active — the tree state at fetch time is guaranteed
@@ -54,7 +56,7 @@ async fn start_kv_router_background_event_plane(
     // No blocking wait — recovery happens asynchronously as endpoints are discovered.
     let worker_query_client = WorkerQueryClient::spawn(
         component.clone(),
-        indexer,
+        target,
         workers_with_configs,
         model,
         worker_type,
@@ -83,11 +85,12 @@ async fn start_kv_router_background_event_plane(
         }
     }
 
+    let consumer_client = worker_query_client.clone();
     tokio::spawn(async move {
-        consume_events(subscriber, worker_query_client, cancellation_token).await;
+        consume_events(subscriber, consumer_client, cancellation_token).await;
     });
 
-    Ok(())
+    Ok(worker_query_client)
 }
 
 async fn consume_events(
@@ -200,7 +203,7 @@ pub async fn start_subscriber(
 
         start_kv_router_background_event_plane(
             component,
-            indexer,
+            Arc::new(IndexerRecoveryTarget::new(indexer)),
             transport_kind,
             workers_with_configs,
             model,
@@ -208,5 +211,26 @@ pub async fn start_subscriber(
             cancellation_token,
         )
         .await
+        .map(|_| ())
     }
+}
+
+pub(crate) async fn start_kv_dc_relay_subscriber(
+    component: Component,
+    target: Arc<dyn RecoveryTarget>,
+    workers_with_configs: RuntimeConfigWatch,
+    model: String,
+    cancellation_token: CancellationToken,
+) -> Result<Arc<WorkerQueryClient>> {
+    let transport_kind = component.drt().default_event_transport_kind();
+    start_kv_router_background_event_plane(
+        component,
+        target,
+        transport_kind,
+        workers_with_configs,
+        model,
+        "kv_dc_relay",
+        cancellation_token,
+    )
+    .await
 }

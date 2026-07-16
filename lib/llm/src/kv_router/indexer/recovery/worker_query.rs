@@ -21,7 +21,6 @@ use super::worker_query_health::spawn_kv_event_source_health_monitor;
 use super::worker_query_state::{LiveEventAction, PendingDrainAction, RecoveryKey, WorkerState};
 use super::worker_query_transport::{RuntimeWorkerQueryTransport, WorkerQueryTransport};
 use crate::discovery::RuntimeConfigWatch;
-use crate::kv_router::Indexer;
 use dynamo_kv_router::{
     indexer::WorkerKvQueryResponse,
     protocols::{DpRank, KvCacheEventData, RouterEvent, WorkerId},
@@ -41,6 +40,10 @@ use dynamo_kv_router::indexer::{LocalKvIndexer, WorkerKvQueryRequest};
 use dynamo_kv_router::recovery::CursorState;
 #[cfg(test)]
 use dynamo_runtime::pipeline::{AsyncEngine, SingleIn};
+
+#[cfg(test)]
+use super::target::IndexerRecoveryTarget;
+use super::target::RecoveryTarget;
 
 // Recovery retry configuration
 const RECOVERY_MAX_RETRIES: u32 = 8;
@@ -62,8 +65,8 @@ const RECOVERY_CONCURRENCY_LIMIT: usize = 16;
 pub struct WorkerQueryClient {
     component: Component,
     transport: Arc<dyn WorkerQueryTransport>,
-    /// Indexer for applying recovered events and worker removals.
-    indexer: Indexer,
+    /// Backend-neutral destination for live and recovered state.
+    target: Arc<dyn RecoveryTarget>,
     worker_states: DashMap<WorkerId, Arc<Mutex<WorkerState>>>,
     query_endpoints: Arc<WorkerQueryEndpointDirectory>,
     recovery_semaphore: Arc<Semaphore>,
@@ -73,17 +76,26 @@ pub struct WorkerQueryClient {
     recovery_cancels: DashMap<RecoveryKey, CancellationToken>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RecoveryHealthSnapshot {
+    pub(crate) worker_count: usize,
+    pub(crate) rank_count: usize,
+    pub(crate) recovering_rank_count: usize,
+    pub(crate) pending_live_event_count: usize,
+    pub(crate) discovered_endpoint_count: usize,
+}
+
 impl WorkerQueryClient {
     fn new(
         component: Component,
-        indexer: Indexer,
+        target: Arc<dyn RecoveryTarget>,
         transport: Arc<dyn WorkerQueryTransport>,
         cancellation_token: CancellationToken,
     ) -> Arc<Self> {
         Arc::new(Self {
             component,
             transport,
-            indexer,
+            target,
             worker_states: DashMap::new(),
             query_endpoints: Arc::new(WorkerQueryEndpointDirectory::default()),
             recovery_semaphore: Arc::new(Semaphore::new(RECOVERY_CONCURRENCY_LIMIT)),
@@ -102,7 +114,7 @@ impl WorkerQueryClient {
     /// and reports workers whose expected KV event sources are missing.
     pub async fn spawn(
         component: Component,
-        indexer: Indexer,
+        target: Arc<dyn RecoveryTarget>,
         workers_with_configs: RuntimeConfigWatch,
         model: String,
         worker_type: &'static str,
@@ -111,7 +123,7 @@ impl WorkerQueryClient {
         let transport = Arc::new(RuntimeWorkerQueryTransport::new(&component).await?);
         let client = Self::new(
             component.clone(),
-            indexer,
+            target,
             transport,
             cancellation_token.clone(),
         );
@@ -197,6 +209,38 @@ impl WorkerQueryClient {
         Ok(())
     }
 
+    pub(crate) async fn health_snapshot(&self) -> RecoveryHealthSnapshot {
+        let states: Vec<_> = self
+            .worker_states
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        let mut snapshot = RecoveryHealthSnapshot {
+            worker_count: states.len(),
+            discovered_endpoint_count: self.query_endpoints.keys().len(),
+            ..RecoveryHealthSnapshot::default()
+        };
+        for state in states {
+            let state = state.lock().await;
+            snapshot.rank_count = snapshot.rank_count.saturating_add(state.ranks.len());
+            snapshot.recovering_rank_count = snapshot.recovering_rank_count.saturating_add(
+                state
+                    .ranks
+                    .values()
+                    .filter(|rank| rank.recovery_inflight)
+                    .count(),
+            );
+            snapshot.pending_live_event_count = snapshot.pending_live_event_count.saturating_add(
+                state
+                    .ranks
+                    .values()
+                    .map(|rank| rank.pending_live_events.len())
+                    .sum::<usize>(),
+            );
+        }
+        snapshot
+    }
+
     fn get_or_create_worker_state(&self, worker_id: WorkerId) -> Arc<Mutex<WorkerState>> {
         self.worker_states
             .entry(worker_id)
@@ -268,8 +312,10 @@ impl WorkerQueryClient {
         let spawn = {
             let mut worker_state = worker_state.lock().await;
             let action = worker_state.handle_discovered_rank(dp_rank, replaced.is_some());
-            if action.reset_rank {
-                self.indexer.remove_worker_dp_rank(worker_id, dp_rank).await;
+            if action.reset_rank
+                && let Err(error) = self.target.remove_rank(worker_id, dp_rank).await
+            {
+                tracing::warn!(worker_id, dp_rank, %error, "Failed to reset replaced recovery target rank");
             }
             if action.restore_epoch.is_some() {
                 tracing::info!(
@@ -336,22 +382,28 @@ impl WorkerQueryClient {
         if should_remove_worker {
             tracing::warn!("WorkerQueryClient: all dp_ranks gone for worker {worker_id}, removing");
             self.worker_states.remove(&worker_id);
-            self.indexer.remove_worker(worker_id).await;
+            if let Err(error) = self.target.remove_worker(worker_id).await {
+                tracing::warn!(worker_id, %error, "Failed to remove worker from recovery target");
+            }
         }
     }
 
-    async fn apply_worker_clear_locked(&self, worker_state: &mut WorkerState, event: RouterEvent) {
+    async fn apply_worker_clear_locked(
+        &self,
+        worker_state: &mut WorkerState,
+        event: RouterEvent,
+    ) -> anyhow::Result<()> {
         let worker_id = event.worker_id;
         let clear_dp_rank = event.event.dp_rank;
         let clear_event_id = event.event.event_id;
-
-        worker_state.apply_worker_clear_barrier(clear_dp_rank, clear_event_id);
 
         tracing::info!(
             "Applying clear barrier for worker {worker_id}; invalidating recovery across {} dp_ranks",
             worker_state.ranks.len()
         );
-        self.indexer.apply_event(event).await;
+        self.target.apply_event(event).await?;
+        worker_state.apply_worker_clear_barrier(clear_dp_rank, clear_event_id);
+        Ok(())
     }
 
     async fn apply_tree_dump_replace_locked(
@@ -359,11 +411,8 @@ impl WorkerQueryClient {
         worker_id: WorkerId,
         dp_rank: DpRank,
         events: Vec<RouterEvent>,
-    ) {
-        self.indexer.remove_worker_dp_rank(worker_id, dp_rank).await;
-        for event in events {
-            self.indexer.apply_event(event).await;
-        }
+    ) -> anyhow::Result<()> {
+        self.target.replace_rank(worker_id, dp_rank, events).await
     }
 
     pub(crate) async fn handle_live_event(self: &Arc<Self>, event: RouterEvent) {
@@ -371,16 +420,20 @@ impl WorkerQueryClient {
         let dp_rank = event.event.dp_rank;
         let key = (worker_id, dp_rank);
 
+        let worker_state = self.get_or_create_worker_state(worker_id);
         let action = {
-            let worker_state = self.get_or_create_worker_state(worker_id);
             let mut worker_state = worker_state.lock().await;
             match worker_state.observe_live_event(event) {
                 LiveEventAction::ApplyClear(event) => {
-                    tracing::info!(
-                        "Applying clear barrier for worker {worker_id}; invalidating recovery across {} dp_ranks",
-                        worker_state.ranks.len()
-                    );
-                    self.indexer.apply_event(event).await;
+                    if let Err(error) = self
+                        .apply_worker_clear_locked(&mut worker_state, event)
+                        .await
+                    {
+                        let epoch = worker_state.begin_recovery_after_target_failure(dp_rank);
+                        drop(worker_state);
+                        tracing::warn!(worker_id, dp_rank, %error, "Recovery target rejected live clear; scheduling exact restore");
+                        self.spawn_recovery_task(key, epoch, None, None);
+                    }
                     return;
                 }
                 action => action,
@@ -390,7 +443,23 @@ impl WorkerQueryClient {
         match action {
             LiveEventAction::Ignore => {}
             LiveEventAction::ApplyDirect(event) => {
-                self.indexer.apply_event(event).await;
+                let event_id = event.event.event_id;
+                match self.target.apply_event(event).await {
+                    Ok(()) => {
+                        worker_state
+                            .lock()
+                            .await
+                            .commit_applied_event(dp_rank, event_id);
+                    }
+                    Err(error) => {
+                        let epoch = worker_state
+                            .lock()
+                            .await
+                            .begin_recovery_after_target_failure(dp_rank);
+                        tracing::warn!(worker_id, dp_rank, event_id, %error, "Recovery target rejected live event; scheduling exact restore");
+                        self.spawn_recovery_task(key, epoch, None, None);
+                    }
+                }
             }
             LiveEventAction::ApplyClear(_) => unreachable!("clear is applied under worker lock"),
             LiveEventAction::SpawnFullRestore { epoch } => {
@@ -531,19 +600,36 @@ impl WorkerQueryClient {
                     key.1,
                     count = events.len()
                 );
+                let mut applied_all = true;
                 for event in events {
                     let event_id = event.event.event_id;
                     if matches!(&event.event.data, KvCacheEventData::Cleared) {
-                        self.apply_worker_clear_locked(&mut worker_state, event)
-                            .await;
-                        new_cursor = new_cursor.apply_barrier(event_id);
+                        match self
+                            .apply_worker_clear_locked(&mut worker_state, event)
+                            .await
+                        {
+                            Ok(()) => new_cursor = new_cursor.apply_barrier(event_id),
+                            Err(error) => {
+                                tracing::warn!(worker_id = key.0, dp_rank = key.1, event_id, %error, "Recovery target rejected recovered clear");
+                                applied_all = false;
+                                break;
+                            }
+                        }
                         continue;
                     }
-                    self.indexer.apply_event(event).await;
-                    new_cursor = new_cursor.advance_to(event_id);
+                    match self.target.apply_event(event).await {
+                        Ok(()) => new_cursor = new_cursor.advance_to(event_id),
+                        Err(error) => {
+                            tracing::warn!(worker_id = key.0, dp_rank = key.1, event_id, %error, "Recovery target rejected recovered event");
+                            applied_all = false;
+                            break;
+                        }
+                    }
                 }
-                new_cursor = new_cursor.advance_to(last_event_id);
-                successful_response = true;
+                if applied_all {
+                    new_cursor = new_cursor.advance_to(last_event_id);
+                    successful_response = true;
+                }
             }
             Ok(WorkerKvQueryResponse::TreeDump {
                 events,
@@ -564,10 +650,39 @@ impl WorkerQueryClient {
                     last_event_id,
                     "Got tree dump (range too old or unspecified)"
                 );
-                self.apply_tree_dump_replace_locked(key.0, key.1, events)
-                    .await;
-                new_cursor = new_cursor.advance_to(last_event_id);
-                successful_response = true;
+                match self
+                    .apply_tree_dump_replace_locked(key.0, key.1, events)
+                    .await
+                {
+                    Ok(()) => {
+                        new_cursor = new_cursor.advance_to(last_event_id);
+                        successful_response = true;
+                    }
+                    Err(error) => {
+                        tracing::warn!(worker_id = key.0, dp_rank = key.1, %error, "Recovery target rejected tree replacement")
+                    }
+                }
+            }
+            Ok(WorkerKvQueryResponse::TreeDumpFailed {
+                last_event_id,
+                message,
+            }) => {
+                tracing::warn!(
+                    worker_id = key.0,
+                    dp_rank = key.1,
+                    last_event_id,
+                    failure = %message,
+                    "Applying degraded rank reset after worker tree-dump failure"
+                );
+                match self.target.degraded_reset_rank(key.0, key.1).await {
+                    Ok(()) => {
+                        new_cursor = new_cursor.advance_to(last_event_id);
+                        successful_response = true;
+                    }
+                    Err(error) => {
+                        tracing::warn!(worker_id = key.0, dp_rank = key.1, %error, "Degraded recovery reset failed; cursor will not advance")
+                    }
+                }
             }
             Ok(WorkerKvQueryResponse::TooNew {
                 newest_available, ..
@@ -609,7 +724,15 @@ impl WorkerQueryClient {
             loop {
                 match worker_state.next_pending_drain_action(key.1) {
                     PendingDrainAction::Apply(event) => {
-                        self.indexer.apply_event(event).await;
+                        let event_id = event.event.event_id;
+                        match self.target.apply_event(event).await {
+                            Ok(()) => worker_state.commit_applied_event(key.1, event_id),
+                            Err(error) => {
+                                tracing::warn!(worker_id = key.0, dp_rank = key.1, event_id, %error, "Recovery target rejected buffered live event");
+                                worker_state.finish_failed_recovery(key.1);
+                                break;
+                            }
+                        }
                     }
                     PendingDrainAction::RecoverFrom(start_event_id) => {
                         follow_up_start = Some(start_event_id);
@@ -872,7 +995,7 @@ mod tests {
         let transport = Arc::new(MockWorkerQueryTransport::default());
         let client = WorkerQueryClient::new(
             component,
-            indexer,
+            Arc::new(IndexerRecoveryTarget::new(indexer)),
             transport.clone(),
             CancellationToken::new(),
         );
@@ -1897,6 +2020,114 @@ mod tests {
         let events = kv_indexer.dump_events().await.unwrap();
         assert!(stored_block_hashes_for(&events, 1, 0).is_empty());
         assert_eq!(stored_block_hashes_for(&events, 1, 1), vec![77]);
+    }
+
+    #[tokio::test]
+    async fn test_tree_dump_failure_resets_rank_then_drains_buffered_tail_once() {
+        let (client, transport, kv_indexer) = make_test_client("tree-dump-failed-reset").await;
+        let key = (1, 0);
+        kv_indexer.apply_event(make_store_event(1, 0, 90)).await;
+        kv_indexer.apply_event(make_store_event(1, 1, 91)).await;
+        kv_indexer.flush().await;
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        transport.push_action(
+            key,
+            MockQueryAction {
+                started: Some(started.clone()),
+                release: Some(release.clone()),
+                response: Ok(WorkerKvQueryResponse::TreeDumpFailed {
+                    last_event_id: 10,
+                    message: "forced dump failure".to_string(),
+                }),
+            },
+        );
+
+        client.handle_discovered_worker(key.0, key.1).await;
+        started.notified().await;
+        client.handle_live_event(make_store_event(1, 0, 11)).await;
+        release.notify_waiters();
+
+        wait_for(|| {
+            rank_state_matches(&client, key, |state| {
+                state.last_applied_id() == Some(11) && !state.recovery_inflight
+            })
+        })
+        .await;
+        kv_indexer.flush().await;
+        let events = kv_indexer.dump_events().await.unwrap();
+        assert_eq!(stored_block_hashes_for(&events, 1, 0), vec![11]);
+        assert_eq!(stored_block_hashes_for(&events, 1, 1), vec![91]);
+    }
+
+    struct FailingDegradedResetTarget;
+
+    #[async_trait]
+    impl RecoveryTarget for FailingDegradedResetTarget {
+        async fn apply_event(&self, _event: RouterEvent) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn replace_rank(
+            &self,
+            _worker_id: WorkerId,
+            _dp_rank: DpRank,
+            _events: Vec<RouterEvent>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn remove_rank(&self, _worker_id: WorkerId, _dp_rank: DpRank) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn degraded_reset_rank(
+            &self,
+            _worker_id: WorkerId,
+            _dp_rank: DpRank,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("forced reset failure")
+        }
+
+        async fn remove_worker(&self, _worker_id: WorkerId) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_failed_degraded_reset_does_not_advance_cursor() {
+        let component = make_test_component("degraded-reset-fails").await;
+        let client = WorkerQueryClient::new(
+            component,
+            Arc::new(FailingDegradedResetTarget),
+            Arc::new(MockWorkerQueryTransport::default()),
+            CancellationToken::new(),
+        );
+        let key = (1, 0);
+        {
+            let worker_state = client.get_or_create_worker_state(key.0);
+            let mut worker_state = worker_state.lock().await;
+            let rank = worker_state.ranks.entry(key.1).or_default();
+            rank.cursor = CursorState::Live(4);
+            rank.recovery_inflight = true;
+        }
+
+        client
+            .clone()
+            .finish_recovery_task(
+                key,
+                0,
+                Ok(WorkerKvQueryResponse::TreeDumpFailed {
+                    last_event_id: 10,
+                    message: "dump failed".to_string(),
+                }),
+            )
+            .await;
+
+        assert!(rank_state_matches(&client, key, |state| {
+            state.last_applied_id() == Some(4) && !state.recovery_inflight
+        }));
     }
 
     #[tokio::test]

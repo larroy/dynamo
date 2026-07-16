@@ -89,7 +89,7 @@ impl RankState {
     }
 
     fn next_pending_drain_action(&mut self) -> PendingDrainAction {
-        let mut last_applied_id = self.last_applied_id().unwrap_or(0);
+        let last_applied_id = self.last_applied_id().unwrap_or(0);
         self.fast_prune_stale_pending_prefix(last_applied_id);
 
         loop {
@@ -123,9 +123,6 @@ impl RankState {
                 .pending_live_events
                 .pop_front()
                 .expect("front event exists while draining pending live events");
-            self.cursor = self.cursor.advance_to(front_event_id);
-            last_applied_id = front_event_id;
-            self.clear_max_seen_if_caught_up(last_applied_id);
             return PendingDrainAction::Apply(event);
         }
     }
@@ -184,7 +181,6 @@ impl WorkerState {
                 return LiveEventAction::Ignore;
             }
 
-            self.apply_worker_clear_barrier(dp_rank, event_id);
             return LiveEventAction::ApplyClear(event);
         }
 
@@ -216,10 +212,7 @@ impl WorkerState {
                     start_event_id: expected,
                 }
             }
-            CursorObservation::Contiguous { got }
-            | CursorObservation::FreshAfterBarrier { got, .. } => {
-                rank_state.cursor = rank_state.cursor.advance_to(got);
-                rank_state.clear_max_seen_if_caught_up(got);
+            CursorObservation::Contiguous { .. } | CursorObservation::FreshAfterBarrier { .. } => {
                 LiveEventAction::ApplyDirect(event)
             }
         }
@@ -256,6 +249,18 @@ impl WorkerState {
             .expect("rank state should exist while finishing recovery");
         rank_state.cursor = cursor;
         rank_state.recovery_inflight = true;
+    }
+
+    pub(super) fn commit_applied_event(&mut self, dp_rank: DpRank, event_id: u64) {
+        let rank_state = self.ranks.entry(dp_rank).or_default();
+        rank_state.cursor = rank_state.cursor.advance_to(event_id);
+        rank_state.clear_max_seen_if_caught_up(event_id);
+    }
+
+    pub(super) fn begin_recovery_after_target_failure(&mut self, dp_rank: DpRank) -> u64 {
+        let rank_state = self.ranks.entry(dp_rank).or_default();
+        rank_state.recovery_inflight = true;
+        self.epoch
     }
 
     pub(super) fn next_pending_drain_action(&mut self, dp_rank: DpRank) -> PendingDrainAction {
