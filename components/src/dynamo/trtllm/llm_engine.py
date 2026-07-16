@@ -84,6 +84,7 @@ from dynamo.trtllm.utils.trtllm_utils import deep_update, warn_override_collisio
 if TYPE_CHECKING:
     from tensorrt_llm.metrics import MetricsCollector
 
+    from dynamo._core import KvRemovedEventInput, KvStoredEventInput
     from dynamo._core.backend import EngineMetrics  # type: ignore[import-not-found]
     from dynamo.trtllm.metrics import AdditionalMetricsCollector
 
@@ -215,7 +216,7 @@ class TrtllmLLMEngine(LLMEngine):
         self._partial_block_hashes_by_rank: dict[int, set[int]] = {}
         self._last_event_id_by_rank: dict[int, int] = {}
         # One-shot guards so a misbehaving engine doesn't flood logs.
-        self._warned_dispatch_failed = False
+        self._warned_malformed_kv_event = False
         self._warned_unknown_dp_rank = False
         self._pause_controller: TRTLLMEnginePauseController | None = None
         self._pause_lock = asyncio.Lock()
@@ -550,21 +551,44 @@ class TrtllmLLMEngine(LLMEngine):
                 continue
             if self._additional_metrics is not None:
                 self._additional_metrics.record_kv_event_drain_batch(len(events))
-            for event in events:
-                try:
-                    self._dispatch_kv_event(event)
-                except Exception as e:
-                    if not self._warned_dispatch_failed:
-                        self._warned_dispatch_failed = True
-                        logger.exception(
-                            "Failed to dispatch KV event; suppressing further "
-                            "tracebacks (last error: %s)",
-                            e,
-                        )
+            self._dispatch_kv_events(events)
+
+    def _dispatch_kv_events(self, events: list[dict[str, Any]]) -> None:
+        events_by_rank: dict[int, list[KvStoredEventInput | KvRemovedEventInput]] = {}
+        for event in events:
+            try:
+                normalized = self._normalize_kv_event(event)
+            except (KeyError, TypeError, ValueError) as error:
+                self._warn_malformed_kv_event(error)
+                continue
+            if normalized is not None:
+                rank, normalized_event = normalized
+                events_by_rank.setdefault(rank, []).append(normalized_event)
+
+        for rank, normalized_events in events_by_rank.items():
+            self._kv_publishers[rank].publish_batch(normalized_events)
+
+    def _warn_malformed_kv_event(self, error: Exception) -> None:
+        if not self._warned_malformed_kv_event:
+            self._warned_malformed_kv_event = True
+            logger.warning(
+                "Dropping malformed KV event; suppressing further "
+                "tracebacks (last error: %s)",
+                error,
+                exc_info=True,
+            )
 
     def _dispatch_kv_event(self, event: dict[str, Any]) -> None:
-        """Forward stored / removed events to the right publisher. Other
-        event types are dropped — the Python publisher has no path for them."""
+        """Normalize and publish one event for compatibility with direct callers."""
+        normalized = self._normalize_kv_event(event)
+        if normalized is not None:
+            rank, normalized_event = normalized
+            self._kv_publishers[rank].publish_batch([normalized_event])
+
+    def _normalize_kv_event(
+        self, event: dict[str, Any]
+    ) -> tuple[int, KvStoredEventInput | KvRemovedEventInput] | None:
+        """Normalize one engine event into the typed Rust publisher input."""
         rank = int(event.get("attention_dp_rank", 0))
         event_id = event.get("event_id")
         if event_id is not None:
@@ -591,7 +615,7 @@ class TrtllmLLMEngine(LLMEngine):
                     rank,
                     sorted(self._kv_publishers.keys()),
                 )
-            return
+            return None
         data = event.get("data") or {}
         kind = data.get("type")
         if kind == "stored":
@@ -609,7 +633,7 @@ class TrtllmLLMEngine(LLMEngine):
                         token_num,
                         kv_block_size,
                     )
-                    return
+                    return None
                 block_hash = _to_signed_i64(block.get("block_hash"))
                 if block_hash is None:
                     continue
@@ -622,15 +646,17 @@ class TrtllmLLMEngine(LLMEngine):
                 block_hashes.append(block_hash)
                 token_ids.extend(int(t["token_id"]) for t in block_tokens)
             if not block_hashes:
-                return
-            publisher.publish_stored(
-                token_ids,
-                num_block_tokens,
-                block_hashes,
-                parent_hash,
-                lora_name=data.get("lora_name"),
-                cache_salt=stored_event_cache_salt(data),
-            )
+                return None
+            stored_event: KvStoredEventInput = {
+                "type": "stored",
+                "token_ids": token_ids,
+                "num_block_tokens": num_block_tokens,
+                "block_hashes": block_hashes,
+                "parent_hash": parent_hash,
+                "lora_name": data.get("lora_name"),
+                "cache_salt": stored_event_cache_salt(data),
+            }
+            return rank, stored_event
         elif kind == "removed":
             partial = self._partial_block_hashes_by_rank.get(rank)
             removed: list[int] = []
@@ -643,7 +669,12 @@ class TrtllmLLMEngine(LLMEngine):
                     continue
                 removed.append(block_hash)
             if removed:
-                publisher.publish_removed(removed)
+                removed_event: KvRemovedEventInput = {
+                    "type": "removed",
+                    "block_hashes": removed,
+                }
+                return rank, removed_event
+        return None
 
     def supported_controls(self) -> set[str]:
         return {"release_memory_occupation", "resume_memory_occupation"}

@@ -21,6 +21,46 @@ mod test_event_processing {
     use dynamo_kv_router::zmq_wire::StoredBlockOptions;
 
     #[test]
+    fn test_publish_batch_ignores_empty_and_preserves_order() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<PlacementEvent>>();
+        let publisher = KvEventPublisher {
+            kv_block_size: 1,
+            source: None,
+            cancellation_token: CancellationToken::new(),
+            worker_id: 7,
+            tx,
+            next_event_id: Arc::new(AtomicU64::new(0)),
+        };
+
+        publisher.publish_batch(Vec::new()).unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        publisher
+            .publish_batch(vec![
+                KvCacheEvent {
+                    event_id: 8,
+                    data: KvCacheEventData::Cleared,
+                    dp_rank: 1,
+                },
+                KvCacheEvent {
+                    event_id: 9,
+                    data: KvCacheEventData::Cleared,
+                    dp_rank: 2,
+                },
+            ])
+            .unwrap();
+        let batch = rx.try_recv().unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].event.event_id, 8);
+        assert_eq!(batch[0].event.dp_rank, 1);
+        assert_eq!(batch[1].event.event_id, 9);
+        assert_eq!(batch[1].event.dp_rank, 2);
+    }
+
+    #[test]
     fn test_publish_wraps_event_in_singleton_batch() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<PlacementEvent>>();
         let publisher = KvEventPublisher {

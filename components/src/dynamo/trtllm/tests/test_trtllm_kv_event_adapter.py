@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock
 
 import pytest
@@ -56,5 +57,124 @@ def test_dispatch_kv_event_forwards_per_block_cache_salt() -> None:
 
     engine._dispatch_kv_event(_stored_kv_event())
 
-    publisher.publish_stored.assert_called_once()
-    assert publisher.publish_stored.call_args.kwargs["cache_salt"] == "tenant-a"
+    publisher.publish_batch.assert_called_once()
+    events = publisher.publish_batch.call_args.args[0]
+    assert len(events) == 1
+    assert events[0]["cache_salt"] == "tenant-a"
+
+
+def _engine_for_batch_test() -> TrtllmLLMEngine:
+    engine = TrtllmLLMEngine.__new__(TrtllmLLMEngine)
+    engine._last_event_id_by_rank = {}
+    engine._warned_unknown_dp_rank = False
+    engine._warned_malformed_kv_event = False
+    engine._additional_metrics = None
+    engine._partial_block_hashes_by_rank = {}
+    engine.kv_block_size = 4
+    return engine
+
+
+def test_dispatch_kv_events_groups_native_drain_by_rank_in_order() -> None:
+    engine = _engine_for_batch_test()
+    rank_0 = MagicMock()
+    rank_1 = MagicMock()
+    engine._kv_publishers = {0: rank_0, 1: rank_1}
+
+    first = _stored_kv_event()
+    second = {
+        "event_id": 1,
+        "attention_dp_rank": 1,
+        "data": {"type": "removed", "block_hashes": [200, 201]},
+    }
+    third = _stored_kv_event(cache_salt="tenant-b")
+    third["event_id"] = 2
+    third["data"]["blocks"][0]["block_hash"] = 124
+    third["data"]["lora_name"] = "adapter-b"
+
+    engine._dispatch_kv_events([first, second, third])
+
+    rank_0.publish_batch.assert_called_once()
+    rank_0_events = rank_0.publish_batch.call_args.args[0]
+    assert [event["type"] for event in rank_0_events] == ["stored", "stored"]
+    assert [event["cache_salt"] for event in rank_0_events] == [
+        "tenant-a",
+        "tenant-b",
+    ]
+    assert rank_0_events[1]["lora_name"] == "adapter-b"
+    rank_1.publish_batch.assert_called_once_with(
+        [{"type": "removed", "block_hashes": [200, 201]}]
+    )
+
+
+def test_dispatch_kv_events_skips_partial_blocks_without_empty_batches() -> None:
+    engine = _engine_for_batch_test()
+    publisher = MagicMock()
+    engine._kv_publishers = {0: publisher}
+    engine._partial_block_hashes_by_rank = {0: {123}}
+
+    engine._dispatch_kv_events(
+        [
+            {
+                "event_id": 1,
+                "attention_dp_rank": 0,
+                "data": {"type": "removed", "block_hashes": [123]},
+            }
+        ]
+    )
+
+    publisher.publish_batch.assert_not_called()
+    assert engine._partial_block_hashes_by_rank[0] == set()
+
+
+def test_dispatch_kv_events_drops_unknown_rank_without_empty_batch(caplog) -> None:
+    engine = _engine_for_batch_test()
+    publisher = MagicMock()
+    engine._kv_publishers = {0: publisher}
+    event = _stored_kv_event()
+    event["attention_dp_rank"] = 7
+
+    with caplog.at_level(logging.WARNING):
+        engine._dispatch_kv_events([event])
+
+    publisher.publish_batch.assert_not_called()
+    assert "unknown attention_dp_rank=7" in caplog.text
+
+
+def test_dispatch_kv_events_warns_once_for_malformed_events_and_continues(
+    caplog,
+) -> None:
+    engine = _engine_for_batch_test()
+    publisher = MagicMock()
+    engine._kv_publishers = {0: publisher}
+    malformed = {"attention_dp_rank": None}
+
+    with caplog.at_level(logging.WARNING):
+        engine._dispatch_kv_events([malformed, malformed, _stored_kv_event()])
+
+    publisher.publish_batch.assert_called_once()
+    warnings = [
+        record
+        for record in caplog.records
+        if record.message.startswith("Dropping malformed KV event")
+    ]
+    assert len(warnings) == 1
+
+
+def test_dispatch_kv_events_propagates_unexpected_normalizer_failure() -> None:
+    engine = _engine_for_batch_test()
+    engine._normalize_kv_event = MagicMock(
+        side_effect=RuntimeError("normalizer failed")
+    )
+
+    with pytest.raises(RuntimeError, match="normalizer failed"):
+        engine._dispatch_kv_events([_stored_kv_event()])
+
+
+def test_dispatch_kv_events_propagates_publish_failure() -> None:
+    engine = _engine_for_batch_test()
+    publisher = MagicMock()
+    publisher.publish_batch.side_effect = RuntimeError("publish failed")
+    engine._kv_publishers = {0: publisher}
+
+    with pytest.raises(RuntimeError, match="publish failed"):
+        engine._dispatch_kv_events([_stored_kv_event()])
