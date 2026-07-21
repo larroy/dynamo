@@ -200,9 +200,9 @@ Mix multiple media parts in one message as the context budget allows.
 
 Inkling's controllable thinking is exposed per request: pass `reasoning_effort` as a
 named level (`none` / `minimal` / `low` / `medium` / `high` / `max`) or a float in
-`[0.0, 0.99]`; omitted requests default to `0.9` (high). These are the values in this
-checkpoint's chat template — `xhigh` from the launch blog is not in its map and is
-rejected:
+`[0.0, 0.99]`; omitted requests default to `0.9` (high). `xhigh` (mentioned in the
+launch blog) is not a named level in this checkpoint's chat template — it is silently
+treated as the default rather than returning an error:
 
 ```bash
 curl -s http://localhost:8000/v1/chat/completions \
